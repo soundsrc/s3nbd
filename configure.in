@@ -1,0 +1,15 @@
+AC_INIT(configure.in)
+
+AM_CONFIG_HEADER(config.h)
+AM_INIT_AUTOMAKE(s3fsnbd, 1.0)
+
+AC_LANG_C
+AC_PROG_CC
+AM_PROG_LIBTOOL
+
+NEON_LIBRARY
+NEON_XML_PARSER
+CFLAGS="$CFLAGS `pkg-config fuse --cflags`"
+LIBS="$NEON_LIBS $LIBS `pkg-config fuse --libs` -lssl -lcrypto"
+
+AC_OUTPUT(Makefile src/Makefile)
