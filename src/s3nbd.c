@@ -130,6 +130,8 @@ static int s3fs_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,
 	}
 	// copy relevant portion
 	memcpy(buffer,block + offset,size);
+
+	return 0;
 }
 
 static int s3fs_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
@@ -137,14 +139,13 @@ static int s3fs_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t of
 	uint64_t i, start_block, end_block;
 	unsigned int bytes_to_read, remaining;
 	int res;
-	char key[32];
 
 	// compute start and end block
 	start_block = offset / BLOCK_SIZE;
 	end_block = (offset + size - 1) / BLOCK_SIZE;
 
 #if __DEBUG__
-	printf("read() size=%ld, offset=%lld\n",size,offset);
+	printf("read() size=%d, offset=%lld\n",size,offset);
 #endif
 	remaining = size;
 	if(start_block == end_block) {
@@ -171,7 +172,7 @@ static int s3fs_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t of
 }
 
 // size must be multiple of 4
-static int is_zero_block(char *buffer,size_t size)
+static int is_zero_block(unsigned char *buffer,size_t size)
 {
 	uint32_t *d;
 
@@ -218,6 +219,8 @@ static int s3fs_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockno
 	printf("  s3put() path=/%s/%s, block=%lld, size=%d, offset=%lld\n",bucket,key,blockno,BLOCK_SIZE,offset);
 #endif
 	}
+
+	return 0;
 }
 
 static int s3fs_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
@@ -230,7 +233,7 @@ static int s3fs_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t o
 	end_block = (offset + size - 1) / BLOCK_SIZE;
 
 #if __DEBUG__
-	printf("write() size=%ld, offset=%lld\n",size,offset);
+	printf("write() size=%d, offset=%lld\n",size,offset);
 #endif
 	remaining = size;
 	if(start_block == end_block) {
@@ -276,7 +279,7 @@ int s3fs_server(int sock)
 		return -1;
 	}
 
-	size = htonll(0x1FFFFFFFFFF);
+	size = htonll(0x1FFFFFFFFFFLL);
 	if(write_sock(sock,&size,8) < 0) {
 		fprintf(stderr,"Negotiation failed.\n");
 		return -1;
@@ -479,7 +482,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	res = listen(sockfd,5);
+	res = listen(sockfd,1);
 	if(res < 0) {
 		fprintf(stderr,"Failed to listen on socket.\n");
 		return -1;
@@ -488,7 +491,7 @@ int main(int argc, char *argv[])
 	for(;;) {
 		int sock;
 		struct sockaddr_in client_addr;
-		int sin_size;
+		socklen_t sin_size;
 
 		sock = accept(sockfd,(struct sockaddr *)&client_addr,&sin_size);
 		if(sock < 0) {
