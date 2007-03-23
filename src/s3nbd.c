@@ -106,7 +106,7 @@ inline static int write_sock(int sock,void *buffer,size_t len)
 
 #define BLOCK_SIZE 4096
 
-static int s3fs_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
+static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
 {
 	int res;
 	unsigned char block[BLOCK_SIZE];
@@ -134,7 +134,7 @@ static int s3fs_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,
 	return 0;
 }
 
-static int s3fs_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
+static int s3nbd_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
 {
 	uint64_t i, start_block, end_block;
 	unsigned int bytes_to_read, remaining;
@@ -149,23 +149,23 @@ static int s3fs_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t of
 #endif
 	remaining = size;
 	if(start_block == end_block) {
-		res = s3fs_read_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
+		res = s3nbd_read_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
 	} else {
 		// copy start block portion
 		bytes_to_read = BLOCK_SIZE - (offset & (BLOCK_SIZE - 1));
-		res = s3fs_read_block(s3,bucket,buffer,start_block,bytes_to_read,offset & (BLOCK_SIZE - 1));
+		res = s3nbd_read_block(s3,bucket,buffer,start_block,bytes_to_read,offset & (BLOCK_SIZE - 1));
 		buffer += bytes_to_read;
 		remaining -= bytes_to_read;
 
 		// copy each block in between
 		for(i = start_block + 1; i < end_block; i++) {
-			s3fs_read_block(s3,bucket,buffer,i,BLOCK_SIZE,0);
+			s3nbd_read_block(s3,bucket,buffer,i,BLOCK_SIZE,0);
 			buffer += BLOCK_SIZE;
 			remaining -= BLOCK_SIZE;
 		}
 
 		// copy end block portion
-		res = s3fs_read_block(s3,bucket,buffer,end_block,remaining,0);
+		res = s3nbd_read_block(s3,bucket,buffer,end_block,remaining,0);
 	}
 
 	return res;
@@ -185,7 +185,7 @@ static int is_zero_block(unsigned char *buffer,size_t size)
 	return 1;
 }
 
-static int s3fs_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
+static int s3nbd_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
 {
 	int res;
 	unsigned char block[BLOCK_SIZE];
@@ -223,7 +223,7 @@ static int s3fs_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockno
 	return 0;
 }
 
-static int s3fs_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
+static int s3nbd_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t offset)
 {
 	uint64_t i, start_block, end_block;
 	int res = 0;
@@ -237,26 +237,26 @@ static int s3fs_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t o
 #endif
 	remaining = size;
 	if(start_block == end_block) {
-		res = s3fs_write_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
+		res = s3nbd_write_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
 	} else {
 		bytes_to_write = BLOCK_SIZE - (offset & (BLOCK_SIZE - 1));
-		res = s3fs_write_block(s3,bucket,buffer,start_block,bytes_to_write,offset & (BLOCK_SIZE - 1));
+		res = s3nbd_write_block(s3,bucket,buffer,start_block,bytes_to_write,offset & (BLOCK_SIZE - 1));
         buffer += bytes_to_write;
 		remaining -= bytes_to_write;
 
 		for(i = start_block + 1; i < end_block; i++) {
-			res = s3fs_write_block(s3,bucket,buffer,i,BLOCK_SIZE,0);
+			res = s3nbd_write_block(s3,bucket,buffer,i,BLOCK_SIZE,0);
 			buffer += BLOCK_SIZE;
 			remaining -= BLOCK_SIZE;
 		}
 
-		res = s3fs_write_block(s3,bucket,buffer,end_block,remaining,0);
+		res = s3nbd_write_block(s3,bucket,buffer,end_block,remaining,0);
 	}
 
 	return res;
 }
 
-int s3fs_server(int sock)
+int s3nbd_server(int sock)
 {
 	// negotiation??
 	char zeros[128];
@@ -321,12 +321,12 @@ int s3fs_server(int sock)
 					len = ntohl(request.len);
 					from = ntohll(request.from);
 					while(len > 32768) {
-						s3fs_read(s3,aws_bucket,block,32768,from);
+						s3nbd_read(s3,aws_bucket,block,32768,from);
 						write_sock(sock,block,32768);
 						len -= 32768;
 						from += 32768;
 					}
-					s3fs_read(s3,aws_bucket,block,len,from);
+					s3nbd_read(s3,aws_bucket,block,len,from);
 					write_sock(sock,block,len);
 				}
 				break;
@@ -339,12 +339,12 @@ int s3fs_server(int sock)
 					from = ntohll(request.from);
 					while(len > 32768) {
 						read_sock(sock,block,32768);
-						s3fs_write(s3,aws_bucket,block,32768,from);
+						s3nbd_write(s3,aws_bucket,block,32768,from);
 						len -= 32768;
 						from += 32768;
 					}
 					read_sock(sock,block,len);
-					s3fs_write(s3,aws_bucket,block,len,from);
+					s3nbd_write(s3,aws_bucket,block,len,from);
 
 					reply.magic = htonl(NBD_REPLY_MAGIC);
 					reply.error = htonl(0);
@@ -499,6 +499,6 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
-		s3fs_server(sock);
+		s3nbd_server(sock);
 	}
 }
