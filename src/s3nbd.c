@@ -113,23 +113,27 @@ inline static int write_sock(int sock,void *buffer,size_t len)
 
 #define BLOCK_SIZE 4096
 
-static void encrypt_block(unsigned char *block,unsigned char *ivec)
+static void encrypt_block(unsigned char *block,const unsigned char *ivec)
 {
 	int num = 0;
 	unsigned char dec_block[BLOCK_SIZE];
+	unsigned char ivec_copy[8];
+	memcpy(ivec_copy,ivec,8);
 	memcpy(dec_block,block,BLOCK_SIZE);
-	BF_cfb64_encrypt(dec_block,block,BLOCK_SIZE,&bf_key,ivec,&num,BF_ENCRYPT);
+	BF_cfb64_encrypt(dec_block,block,BLOCK_SIZE,&bf_key,ivec_copy,&num,BF_ENCRYPT);
 }
 
-static void decrypt_block(unsigned char *block,unsigned char *ivec)
+static void decrypt_block(unsigned char *block,const unsigned char *ivec)
 {
 	int num = 0;
 	unsigned char enc_block[BLOCK_SIZE];
+	unsigned char ivec_copy[8];
+	memcpy(ivec_copy,ivec,8);
 	memcpy(enc_block,block,BLOCK_SIZE);
-	BF_cfb64_encrypt(enc_block,block,BLOCK_SIZE,&bf_key,ivec,&num,BF_DECRYPT);
+	BF_cfb64_encrypt(enc_block,block,BLOCK_SIZE,&bf_key,ivec_copy,&num,BF_DECRYPT);
 }
 
-static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
+static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,uint64_t blockno,size_t size,off_t offset)
 {
 	int res;
 	unsigned char block[BLOCK_SIZE];
@@ -212,7 +216,7 @@ static int is_zero_block(unsigned char *buffer,size_t size)
 	return 1;
 }
 
-static int s3nbd_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
+static int s3nbd_write_block(S3 *s3,const char *bucket,char *buffer,uint64_t blockno,size_t size,off_t offset)
 {
 	int res;
 	unsigned char block[BLOCK_SIZE];
@@ -398,8 +402,6 @@ disc:
 	printf("Client disconnected.\n");
 #endif
 	free_S3(s3);
-	memset(aws_access_id,0,256);
-	memset(aws_secret_key,0,256);
 
 	return 0;
 }
@@ -558,7 +560,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	res = listen(sockfd,1);
+	res = listen(sockfd,0);
 	if(res < 0) {
 		fprintf(stderr,"Failed to listen on socket.\n");
 		return -1;
