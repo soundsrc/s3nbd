@@ -27,6 +27,7 @@
 #include <ne_string.h>
 #include <ne_session.h>
 #include <ne_request.h>
+#include <ne_socket.h>
 #include <ne_xml.h>
 #include "libs3.h"
 
@@ -93,12 +94,32 @@ S3 *new_S3(const char *access_id,const char *secret_key)
 {
 	S3 *s3;
 
+	if(!access_id) return NULL;
+	if(!secret_key) return NULL;
+
+	if(strlen(access_id) > 63) return NULL;
+	if(strlen(secret_key) > 63) return NULL;
+
 	s3 = (S3 *)calloc(1,sizeof(S3));
 	if(!s3) {
 		fprintf(stderr,"Could not create S3 object. Out of memory.\n");
 		exit(1);
 	}
-	init_s3(s3,access_id,secret_key);
+
+	strcpy(s3->access_id,access_id);
+	strcpy(s3->secret_key,secret_key);
+	s3->error[0] = 0;
+
+	s3->session = NULL;
+	s3->session_count = 0;
+
+	s3->key_info.nb_name = ne_buffer_create();
+	s3->key_info.nb_etag = ne_buffer_create();
+	s3->key_info.nb_storage_class = ne_buffer_create();
+	s3->key_info.nb_owner_id = ne_buffer_create();
+	s3->key_info.nb_owner_display_name = ne_buffer_create();
+
+	ne_sock_init();
 
 	return s3;
 }
@@ -113,43 +134,41 @@ void free_S3(S3 *s3)
 		ne_buffer_destroy(s3->key_info.nb_owner_display_name);
 		memset(s3->access_id,0,64);
 		memset(s3->secret_key,0,64);
+		ne_sock_exit();
 		free(s3);
 	}
 }
 
-int init_s3(S3 *s3,const char *access_id,const char *secret_key)
+void s3_begin_session(S3 *s3)
 {
-	if(!s3) return -1;
-	if(!access_id) return -1;
-	if(!secret_key) return -1;
-
-	if(strlen(access_id) > 63) return -1;
-	if(strlen(secret_key) > 63) return -1;
-
-	strcpy(s3->access_id,access_id);
-	strcpy(s3->secret_key,secret_key);
-	s3->error[0] = 0;
-
-	s3->key_info.nb_name = ne_buffer_create();
-	s3->key_info.nb_etag = ne_buffer_create();
-	s3->key_info.nb_storage_class = ne_buffer_create();
-	s3->key_info.nb_owner_id = ne_buffer_create();
-	s3->key_info.nb_owner_display_name = ne_buffer_create();
-
-	return 0;
+	if(s3) {
+		if(s3->session_count == 0) s3->session = ne_session_create("http",AWS_S3_URL,80);
+		s3->session_count++;
+	}
 }
 
-static void s3_new_request(const S3 *s3,const char *method,const char *bucket,const char *key,const char *params,const char *content_type,ne_session **out_sess,ne_request **out_req)
+void s3_end_session(S3 *s3)
+{
+	if(s3 && s3->session) {
+		s3->session_count--;
+		if(s3->session_count == 0) {
+			ne_session_destroy(s3->session);
+			s3->session = NULL;
+		}
+	}
+}
+
+static ne_request *s3_new_request(const S3 *s3,const char *method,const char *bucket,const char *key,const char *params,const char *content_type)
 {
 	ne_buffer *date, *signing_string, *request_str;
-	ne_session *sess;
 	ne_request *req;
 	char *sig, *p;
 	time_t t;
 
-	if(!s3) return;
-	if(!method) return;
-	if(!bucket) return;
+	if(!s3) return NULL;
+	if(!method) return NULL;
+	if(!bucket) return NULL;
+	if(!s3->session) return NULL;
 
 	// create some string buffers
 	date = ne_buffer_create();
@@ -163,9 +182,6 @@ static void s3_new_request(const S3 *s3,const char *method,const char *bucket,co
 		date->data[date->used - 2] = 0;
 	ne_buffer_altered(date);
 
-	// create session
-	sess = ne_session_create("http",AWS_S3_URL,80);
-
 	// create request
 	if(key) ne_buffer_concat(request_str,"/",bucket,"/",key,NULL);
 	else ne_buffer_concat(request_str,"/",bucket,NULL);
@@ -175,7 +191,7 @@ static void s3_new_request(const S3 *s3,const char *method,const char *bucket,co
 		ne_buffer_zappend(request_str,params);
 	}
 
-	req = ne_request_create(sess,method,request_str->data);
+	req = ne_request_create(s3->session,method,request_str->data);
 
 	// Add date header
 	ne_add_request_header(req,"Date",date->data);
@@ -202,20 +218,20 @@ static void s3_new_request(const S3 *s3,const char *method,const char *bucket,co
 	ne_buffer_destroy(request_str);
 	free(sig);
 
-	if(out_req) *out_req = req;
-	if(out_sess) *out_sess = sess;
+	return req;
 }
 
 int s3_create_bucket(S3 *s3,const char *bucket)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 
 	if(!s3) return -1;
 	if(!bucket) return -1;
 
-	s3_new_request(s3,"PUT",bucket,NULL,NULL,NULL,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"PUT",bucket,NULL,NULL,NULL);
 
 	// send to server
 	do {
@@ -231,21 +247,22 @@ int s3_create_bucket(S3 *s3,const char *bucket)
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
 
 int s3_delete_bucket(S3 *s3,const char *bucket)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 
 	if(!s3) return -1;
 	if(!bucket) return -1;
 
-	s3_new_request(s3,"DELETE",bucket,NULL,NULL,NULL,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"DELETE",bucket,NULL,NULL,NULL);
 
 	// send to server
 	do {
@@ -261,7 +278,7 @@ int s3_delete_bucket(S3 *s3,const char *bucket)
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
@@ -355,7 +372,6 @@ int s3_get_bucket(S3 *s3,const char *bucket,
 	const char *prefix,const char *marker,int max_keys,const char *delimiter,
 	const S3KeyInfoCallback *key_info_cb)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 	ne_buffer *params;
@@ -374,7 +390,9 @@ int s3_get_bucket(S3 *s3,const char *bucket,
 	}
 	if(delimiter) ne_buffer_concat(params,"delimiter=",delimiter,"&",NULL);
 
-	s3_new_request(s3,"GET",bucket,NULL,params->data,NULL,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"GET",bucket,NULL,params->data,NULL);
 
 	ne_buffer_destroy(params);
 
@@ -401,14 +419,13 @@ int s3_get_bucket(S3 *s3,const char *bucket,
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
 
 int s3_put_object(S3 *s3,const char *bucket,const char *key,const char *content_type,int content_length,const S3ReadCallback *rcb)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 
@@ -416,7 +433,9 @@ int s3_put_object(S3 *s3,const char *bucket,const char *key,const char *content_
 	if(!bucket) return -1;
 	if(!rcb) return -1;
 
-	s3_new_request(s3,"PUT",bucket,key,NULL,content_type,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"PUT",bucket,key,NULL,content_type);
 
 	ne_print_request_header(req,"Content-Length","%d",content_length);
 
@@ -441,14 +460,13 @@ int s3_put_object(S3 *s3,const char *bucket,const char *key,const char *content_
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
 
 int s3_get_object(S3 *s3,const char *bucket,const char *key,const S3WriteCallback *wcb)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 
@@ -456,7 +474,9 @@ int s3_get_object(S3 *s3,const char *bucket,const char *key,const S3WriteCallbac
 	if(!bucket) return -1;
 	if(!wcb) return -1;
 
-	s3_new_request(s3,"GET",bucket,key,NULL,NULL,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"GET",bucket,key,NULL,NULL);
 	// send to server
 	do {
 		err = ne_begin_request(req);
@@ -479,23 +499,24 @@ int s3_get_object(S3 *s3,const char *bucket,const char *key,const S3WriteCallbac
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
 
 int s3_head_object(S3 *s3,const char *bucket,const char *key,S3ObjectInfo *oi)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err;
 
 	if(!s3) return -1;
 	if(!bucket) return -1;
 
-	s3_new_request(s3,"HEAD",bucket,key,NULL,NULL,&sess,&req);
-	// send to server
+	s3_begin_session(s3);
 
+	req = s3_new_request(s3,"HEAD",bucket,key,NULL,NULL);
+
+	// send to server
 	err = ne_request_dispatch(req);
 	if(err != NE_OK) err = -EIO;
 
@@ -520,21 +541,22 @@ int s3_head_object(S3 *s3,const char *bucket,const char *key,S3ObjectInfo *oi)
 	}
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }
 
 int s3_delete_object(S3 *s3,const char *bucket,const char *key)
 {
-	ne_session *sess;
 	ne_request *req;
 	int err, retry;
 
 	if(!s3) return -1;
 	if(!bucket) return -1;
 
-	s3_new_request(s3,"DELETE",bucket,key,NULL,NULL,&sess,&req);
+	s3_begin_session(s3);
+
+	req = s3_new_request(s3,"DELETE",bucket,key,NULL,NULL);
 
 	// send to server
 	do {
@@ -550,7 +572,7 @@ int s3_delete_object(S3 *s3,const char *bucket,const char *key)
 	} while(retry == NE_RETRY);
 
 	ne_request_destroy(req);
-	ne_session_destroy(sess);
+	s3_end_session(s3);
 
 	return err;
 }

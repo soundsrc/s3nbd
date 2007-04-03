@@ -41,6 +41,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <openssl/blowfish.h>
+
 #include "libs3.h"
 
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -76,6 +78,11 @@ static char aws_access_id[256];
 static char aws_secret_key[256];
 static char aws_bucket[256];
 
+static uint64_t bd_volume_size = 0x1FFFFFFFFFFLL;
+
+static int encrypt = 0;
+static BF_KEY bf_key;
+
 inline static int read_sock(int sock,void *buffer,size_t len)
 {
 	size_t bytes_read;
@@ -106,6 +113,22 @@ inline static int write_sock(int sock,void *buffer,size_t len)
 
 #define BLOCK_SIZE 4096
 
+static void encrypt_block(unsigned char *block,unsigned char *ivec)
+{
+	int num = 0;
+	unsigned char dec_block[BLOCK_SIZE];
+	memcpy(dec_block,block,BLOCK_SIZE);
+	BF_cfb64_encrypt(dec_block,block,BLOCK_SIZE,&bf_key,ivec,&num,BF_ENCRYPT);
+}
+
+static void decrypt_block(unsigned char *block,unsigned char *ivec)
+{
+	int num = 0;
+	unsigned char enc_block[BLOCK_SIZE];
+	memcpy(enc_block,block,BLOCK_SIZE);
+	BF_cfb64_encrypt(enc_block,block,BLOCK_SIZE,&bf_key,ivec,&num,BF_DECRYPT);
+}
+
 static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno,size_t size,off_t offset)
 {
 	int res;
@@ -116,7 +139,7 @@ static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno
 
 	snprintf(key,32,"nbd/%.16llx",blockno); key[31] = 0;
 #if __DEBUG__
-	printf("  s3_get() path=/%s/%s, block=%lld, size=%d, offset=%lld\n",bucket,key,blockno,BLOCK_SIZE,offset);
+	printf("  s3_get() path=/%s/%s, block=%llu, size=%d, offset=%lld\n",bucket,key,blockno,BLOCK_SIZE,offset);
 #endif
 	res = s3_get_object(s3,bucket,key,s3_mem_wcb(block,BLOCK_SIZE));
 	if(res == -ENOENT) {
@@ -127,7 +150,7 @@ static int s3nbd_read_block(S3 *s3,const char *bucket,char *buffer,off_t blockno
 	} else if(res != 0) {
 		fprintf(stderr,"%s\n",s3->error);
 		return -1;
-	}
+	} else if(encrypt) decrypt_block(block,(unsigned char *)&blockno);
 	// copy relevant portion
 	memcpy(buffer,block + offset,size);
 
@@ -151,6 +174,8 @@ static int s3nbd_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t o
 	if(start_block == end_block) {
 		res = s3nbd_read_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
 	} else {
+		s3_begin_session(s3);
+
 		// copy start block portion
 		bytes_to_read = BLOCK_SIZE - (offset & (BLOCK_SIZE - 1));
 		res = s3nbd_read_block(s3,bucket,buffer,start_block,bytes_to_read,offset & (BLOCK_SIZE - 1));
@@ -166,6 +191,8 @@ static int s3nbd_read(S3 *s3,const char *bucket,char *buffer,size_t size,off_t o
 
 		// copy end block portion
 		res = s3nbd_read_block(s3,bucket,buffer,end_block,remaining,0);
+
+		s3_end_session(s3);
 	}
 
 	return res;
@@ -202,6 +229,7 @@ static int s3nbd_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockn
 	printf("  s3_get() path=/%s/%s, size=%d\n",bucket,key,BLOCK_SIZE);
 #endif
 		} else if(res != 0) return -1;
+		else if(encrypt) decrypt_block(block,(unsigned char *)&blockno);
 #if __DEBUG__
 	printf("  s3_get() path=/%s/%s, size=%d\n",bucket,key,BLOCK_SIZE);
 #endif
@@ -214,9 +242,10 @@ static int s3nbd_write_block(S3 *s3,const char *bucket,char *buffer,off_t blockn
 	printf("  s3_delete() path=/%s/%s\n",bucket,key);
 #endif
 	} else {
+		if(encrypt) encrypt_block(block,(unsigned char *)&blockno);
 		s3_put_object(s3,bucket,key,"binary/octet-stream",BLOCK_SIZE,s3_mem_rcb(block,BLOCK_SIZE));
 #if __DEBUG__
-	printf("  s3put() path=/%s/%s, block=%lld, size=%d, offset=%lld\n",bucket,key,blockno,BLOCK_SIZE,offset);
+	printf("  s3put() path=/%s/%s, block=%llu, size=%d, offset=%lld\n",bucket,key,blockno,BLOCK_SIZE,offset);
 #endif
 	}
 
@@ -239,6 +268,8 @@ static int s3nbd_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t 
 	if(start_block == end_block) {
 		res = s3nbd_write_block(s3,bucket,buffer,start_block,size,offset & (BLOCK_SIZE - 1));
 	} else {
+		s3_begin_session(s3);
+
 		bytes_to_write = BLOCK_SIZE - (offset & (BLOCK_SIZE - 1));
 		res = s3nbd_write_block(s3,bucket,buffer,start_block,bytes_to_write,offset & (BLOCK_SIZE - 1));
         buffer += bytes_to_write;
@@ -251,6 +282,8 @@ static int s3nbd_write(S3 *s3,const char *bucket,char *buffer,size_t size,off_t 
 		}
 
 		res = s3nbd_write_block(s3,bucket,buffer,end_block,remaining,0);
+
+		s3_end_session(s3);
 	}
 
 	return res;
@@ -279,7 +312,7 @@ int s3nbd_server(int sock)
 		return -1;
 	}
 
-	size = htonll(0x1FFFFFFFFFFLL);
+	size = htonll(bd_volume_size);
 	if(write_sock(sock,&size,8) < 0) {
 		fprintf(stderr,"Negotiation failed.\n");
 		return -1;
@@ -383,16 +416,38 @@ int main(int argc, char *argv[])
 		{ "id", 1, 0, 'i' },
 		{ "secret", 1, 0, 's' },
 		{ "bucket", 1, 0, 'b' },
+		{ "size", 1, 0, 'v' },
+		{ "encrypt", 0, 0, 'e' },
 		{ 0, 0, 0, 0 }
 	};
 	int option_index = 0;
 	S3 *s3;
+	const char *env;
 
 	aws_access_id[0] = 0;
 	aws_secret_key[0] = 0;
 	aws_bucket[0] = 0;
 
-	while((c = getopt_long(argc,argv,"p:i:s:b:",long_options,&option_index)) != -1) {
+	// check environment variables
+    env = getenv("AWS_ACCESS_ID");
+    if(env) {
+    	strncpy(aws_access_id,env,256);
+    	aws_access_id[255] = 0;
+    }
+
+    env = getenv("AWS_SECRET_KEY");
+    if(env) {
+    	strncpy(aws_secret_key,env,256);
+    	aws_secret_key[255] = 0;
+    }
+
+    env = getenv("AWS_BUCKET");
+    if(env) {
+    	strncpy(aws_bucket,env,256);
+    	aws_bucket[255] = 0;
+    }
+
+	while((c = getopt_long(argc,argv,"p:i:s:b:v:e",long_options,&option_index)) != -1) {
 		switch(c) {
 			case 'p':
 				port = strtol(optarg,NULL,0);
@@ -405,17 +460,26 @@ int main(int argc, char *argv[])
 				strncpy(aws_secret_key,optarg,256);
 				aws_secret_key[255] = 0;
 				break;
+			case 'v':
+				bd_volume_size = strtoll(optarg,NULL,10);
+				bd_volume_size *= (1024 * 1024);
+				break;
 			case 'b':
 				strncpy(aws_bucket,optarg,256);
 				aws_bucket[255] = 0;
 				break;
+			case 'e':
+				encrypt = 1;
+				break;
 			default:
-				fprintf(stderr,"Usage: s3fs-nbd [options..]\n");
+				fprintf(stderr,"Usage: s3nbd [options..]\n");
 				fprintf(stderr,"Options:\n");
 				fprintf(stderr,"  -p PORT, --port=PORT       Listen on port (default: 5353).\n");
 				fprintf(stderr,"  -i ID, --id=ID             Specify AWS ID.\n");
 				fprintf(stderr,"  -s SECRET, --secret=SECRET AWS secret key.\n");
 				fprintf(stderr,"  -b BUCKET, --bucket=BUCKET AWS bucket to use.\n");
+				fprintf(stderr,"  -v SIZE, --size=SIZE       Set volume size (MB).\n");
+				fprintf(stderr,"  -e, --encrypt              Enable encryption (experimental).\n");
 				fprintf(stderr,"\n");
 				exit(1);
 		}
@@ -450,6 +514,18 @@ int main(int argc, char *argv[])
 		len = strlen(aws_bucket);
 		while(len && aws_bucket[--len] == '\n')
 			aws_bucket[len] = 0;
+	}
+
+	if(encrypt) {
+		char enc_key[57];
+		printf("Warning, encryption is experimental.\n");
+		printf("And NEVER forget your password.\n");
+		printf("Encryption password: ");
+		fflush(stdout);
+		fgets(enc_key,56,stdin);
+		enc_key[56] = 0;
+		BF_set_key(&bf_key,strlen(enc_key),(unsigned char *)enc_key);
+		memset(enc_key,0,56);
 	}
 
 	// test credentials
@@ -501,4 +577,6 @@ int main(int argc, char *argv[])
 
 		s3nbd_server(sock);
 	}
+
+	return 0;
 }
